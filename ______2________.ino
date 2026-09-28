@@ -1,162 +1,158 @@
-const uint8_t PIN_RED    = 13;
-const uint8_t PIN_YELLOW = 12;
-const uint8_t PIN_GREEN  = 11;
-const uint8_t PIN_BTN_PED  = 2;
-const uint8_t PIN_BTN_EMER = 3;
+enum State { S_GREEN, S_YELLOW, S_RED, S_WARNING, NUM_S };
+enum Event { E_NONE, E_TIMER, E_PED, E_NIGHT, NUM_E };
 
-const unsigned long T_GREEN        = 10000;
-const unsigned long T_YELLOW       = 3000;
-const unsigned long T_RED          = 10000;
-const unsigned long T_RED_PED      = 15000;
-const unsigned long T_WARNING_HALF = 500;
+State st = S_GREEN;
+unsigned long tStart = 0, dur = 0;
+bool pedReq = false, night = false;
+bool blinkOn = false;
+unsigned long lastBlink = 0;
 
-const unsigned long DEBOUNCE_MS   = 80;
-const unsigned long MIN_EVENT_GAP = 250;
+typedef void (*H)();
+H table[NUM_S][NUM_E];
 
-enum State { S_GREEN, S_YELLOW, S_RED, S_WARNING };
-State currentState = S_GREEN;
-
-unsigned long stateStart = 0;
-unsigned long duration   = 0;
-bool pedRequest = false;
-bool emergency  = false;
-
-unsigned long lastBlinkMillis = 0;
-bool          blinkOn         = false;
-
-struct Button {
-  uint8_t       pin;
-  bool          stable;
-  bool          lastRaw;
-  unsigned long lastChangeMs;
-  unsigned long lastEventMs;
-};
-
-Button btnPed  = { PIN_BTN_PED,  false, false, 0, 0 };
-Button btnEmer = { PIN_BTN_EMER, false, false, 0, 0 };
-
-bool buttonPressed(Button &b) {
-  bool raw = (digitalRead(b.pin) == LOW);
-  unsigned long now = millis();
-
-  if (raw != b.lastRaw) {
-    b.lastRaw = raw;
-    b.lastChangeMs = now;
-  }
-
-  if ((now - b.lastChangeMs) >= DEBOUNCE_MS && raw != b.stable) {
-    b.stable = raw;
-    if (b.stable) {
-      if (now - b.lastEventMs < MIN_EVENT_GAP) return false;
-      b.lastEventMs = now;
-      return true;
-    }
-  }
-  return false;
+void setOut(State s) {
+  digitalWrite(13, s == S_RED);
+  digitalWrite(12, s == S_YELLOW);
+  digitalWrite(11, s == S_GREEN);
 }
 
-void setOutputsForState(State s) {
-  digitalWrite(PIN_RED,    LOW);
-  digitalWrite(PIN_YELLOW, LOW);
-  digitalWrite(PIN_GREEN,  LOW);
-
-  switch (s) {
-    case S_GREEN:   digitalWrite(PIN_GREEN,  HIGH); break;
-    case S_YELLOW:  digitalWrite(PIN_YELLOW, HIGH); break;
-    case S_RED:     digitalWrite(PIN_RED,    HIGH); break;
-    case S_WARNING: break;
-  }
-}
-
-void goToState(State s, unsigned long dur) {
-  currentState = s;
-  stateStart   = millis();
-  duration     = dur;
-  setOutputsForState(s);
+void goTo(State s, unsigned long d) {
+  st = s;
+  tStart = millis();
+  dur = d;
+  setOut(s);
 
   if (s == S_WARNING) {
-    lastBlinkMillis = millis();
     blinkOn = false;
-    digitalWrite(PIN_YELLOW, LOW);
+    lastBlink = millis();
   }
 
-  Serial.print(F("[FSM] -> "));
-  switch (s) {
-    case S_GREEN:   Serial.print(F("S_GREEN"));   break;
-    case S_YELLOW:  Serial.print(F("S_YELLOW"));  break;
-    case S_RED:     Serial.print(F("S_RED"));     break;
-    case S_WARNING: Serial.print(F("S_WARNING")); break;
-  }
-  Serial.print(F(", dur="));
-  Serial.print(dur);
-  Serial.print(F(", t="));
-  Serial.println(millis());
+  Serial.print(millis());
+  Serial.print(" -> ");
+  Serial.println(s);
 }
 
-void readInputs() {
-  if (buttonPressed(btnPed)) {
-    pedRequest = true;
-    Serial.println(F("[EVT] E_PED_REQ"));
+void hGreenT() {
+  goTo(S_YELLOW, 3000);
+}
+
+void hYellowT() {
+  if (pedReq) {
+    pedReq = false;
+    goTo(S_RED, 15000);
+  } else {
+    goTo(S_RED, 10000);
   }
-  if (buttonPressed(btnEmer)) {
-    emergency = !emergency;
-    Serial.print(F("[EVT] E_EMERGENCY "));
-    Serial.println(emergency ? F("ON") : F("OFF"));
+}
+
+void hRedT() {
+  goTo(S_GREEN, 10000);
+}
+
+void hPed() {
+  pedReq = true;
+  Serial.println("PED REQ");
+}
+
+void hNight() {
+  night = !night;
+  Serial.print("NIGHT = ");
+  Serial.println(night);
+
+  if (night) {
+    goTo(S_WARNING, 500);
+  } else {
+    goTo(S_GREEN, 10000);
   }
+}
+
+void setupTable() {
+  for (int s = 0; s < NUM_S; s++) {
+    for (int e = 0; e < NUM_E; e++) {
+      table[s][e] = 0;
+    }
+  }
+
+  table[S_GREEN][E_TIMER]  = hGreenT;
+  table[S_GREEN][E_PED]    = hPed;
+  table[S_YELLOW][E_TIMER] = hYellowT;
+  table[S_RED][E_TIMER]    = hRedT;
+
+  for (int s = 0; s < NUM_S; s++) {
+    table[s][E_NIGHT] = hNight;
+  }
+}
+
+Event pollEvent() {
+  static bool btnStable = false, btnRaw = false;
+  static unsigned long btnRawChange = 0;
+
+  bool raw = !digitalRead(2);
+
+  if (raw != btnRaw) {
+    btnRaw = raw;
+    btnRawChange = millis();
+  }
+
+  if (millis() - btnRawChange > 50 && btnRaw != btnStable) {
+    btnStable = btnRaw;
+
+    if (btnStable) {
+      return E_PED;
+    }
+  }
+
+  static bool nightStable = false, nightRaw = false;
+  static unsigned long nightRawChange = 0;
+
+  bool rawN = !digitalRead(3);
+
+  if (rawN != nightRaw) {
+    nightRaw = rawN;
+    nightRawChange = millis();
+  }
+
+  if (millis() - nightRawChange > 50 && nightRaw != nightStable) {
+    nightStable = nightRaw;
+
+    if (nightStable) {
+      return E_NIGHT;
+    }
+  }
+
+  if (st != S_WARNING && millis() - tStart >= dur) {
+    return E_TIMER;
+  }
+
+  return E_NONE;
 }
 
 void setup() {
-  pinMode(PIN_RED,    OUTPUT);
-  pinMode(PIN_YELLOW, OUTPUT);
-  pinMode(PIN_GREEN,  OUTPUT);
-  pinMode(PIN_BTN_PED,  INPUT_PULLUP);
-  pinMode(PIN_BTN_EMER, INPUT_PULLUP);
-
   Serial.begin(9600);
-  Serial.println(F("FSM start"));
 
-  goToState(S_GREEN, T_GREEN);
+  pinMode(13, OUTPUT);
+  pinMode(12, OUTPUT);
+  pinMode(11, OUTPUT);
+  pinMode(2, INPUT_PULLUP);
+  pinMode(3, INPUT_PULLUP);
+
+  setupTable();
+  goTo(S_GREEN, 10000);
 }
 
 void loop() {
-  readInputs();
+  if (st == S_WARNING && millis() - lastBlink >= 500) {
+    lastBlink = millis();
+    blinkOn = !blinkOn;
 
-  if (emergency) {
-    if (currentState != S_WARNING) goToState(S_WARNING, T_WARNING_HALF);
-
-    unsigned long now = millis();
-    if (now - lastBlinkMillis >= T_WARNING_HALF) {
-      lastBlinkMillis = now;
-      blinkOn = !blinkOn;
-      digitalWrite(PIN_YELLOW, blinkOn ? HIGH : LOW);
-    }
-    return;
-  } else if (currentState == S_WARNING) {
-    digitalWrite(PIN_YELLOW, LOW);
-    goToState(S_GREEN, T_GREEN);
+    digitalWrite(13, 0);
+    digitalWrite(12, blinkOn);
+    digitalWrite(11, 0);
   }
 
-  switch (currentState) {
-    case S_GREEN:
-      if (millis() - stateStart >= duration) goToState(S_YELLOW, T_YELLOW);
-      break;
+  Event e = pollEvent();
 
-    case S_YELLOW:
-      if (millis() - stateStart >= duration) {
-        if (pedRequest) {
-          pedRequest = false;
-          goToState(S_RED, T_RED_PED);
-        } else {
-          goToState(S_RED, T_RED);
-        }
-      }
-      break;
-
-    case S_RED:
-      if (millis() - stateStart >= duration) goToState(S_GREEN, T_GREEN);
-      break;
-
-    case S_WARNING:
-      break;
+  if (e != E_NONE && table[st][e]) {
+    table[st][e]();
   }
 }
